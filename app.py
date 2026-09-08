@@ -11,7 +11,7 @@ import streamlit as st
 import yfinance as yf
 
 st.set_page_config(
-    page_title="台股量價籌碼分析系統",
+    page_title="台股量價籌碼分析系統 v3",
     page_icon="📈",
     layout="wide",
 )
@@ -19,10 +19,11 @@ st.set_page_config(
 TWSE_UNIVERSE = "https://openapi.twse.com.tw/v1/opendata/t187ap03_L"
 TPEX_UNIVERSE = "https://www.tpex.org.tw/openapi/v1/mopsfin_t187ap03_O"
 
-# ---------- UI ----------
+FIB_RATIOS = [0.191, 0.382, 0.5, 0.618, 0.809]
+
 st.markdown("""
 <style>
-.block-container {padding-top: 1.5rem; max-width: 1500px;}
+.block-container {padding-top: 1.4rem; max-width: 1500px;}
 [data-testid="stMetric"] {
   background: rgba(30,38,60,.42);
   border: 1px solid rgba(120,140,190,.22);
@@ -30,18 +31,13 @@ st.markdown("""
   border-radius: 14px;
 }
 .small-note {opacity:.72; font-size:.85rem}
-.score-good {color:#24c78e;font-weight:800}
-.score-mid {color:#f0b84b;font-weight:800}
-.score-bad {color:#f0646b;font-weight:800}
 </style>
 """, unsafe_allow_html=True)
 
-# ---------- Data helpers ----------
 def clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
-        # Single ticker sometimes still returns a MultiIndex.
         try:
             df.columns = df.columns.get_level_values(0)
         except Exception:
@@ -53,20 +49,17 @@ def clean_ohlcv(df: pd.DataFrame) -> pd.DataFrame:
     for c in needed:
         out[c] = pd.to_numeric(out[c], errors="coerce")
     out = out.dropna(subset=["Open", "High", "Low", "Close"])
-    out = out[out["Volume"].fillna(0) >= 0]
+    out["Volume"] = out["Volume"].fillna(0)
     return out
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_universe():
     rows = []
     headers = {"User-Agent": "Mozilla/5.0"}
-
-    # TWSE
     try:
         r = requests.get(TWSE_UNIVERSE, timeout=15, headers=headers)
         r.raise_for_status()
-        data = r.json()
-        for x in data:
+        for x in r.json():
             code = str(x.get("公司代號", "")).strip()
             name = str(x.get("公司簡稱", x.get("公司名稱", ""))).strip()
             industry = str(x.get("產業別", "")).strip()
@@ -75,13 +68,10 @@ def load_universe():
     except Exception:
         pass
 
-    # TPEx
     try:
         r = requests.get(TPEX_UNIVERSE, timeout=15, headers=headers)
         r.raise_for_status()
-        data = r.json()
-        for x in data:
-            # The TPEx endpoint has used both Chinese and English-like field labels in different releases.
+        for x in r.json():
             code = str(
                 x.get("SecuritiesCompanyCode",
                 x.get("公司代號",
@@ -100,8 +90,9 @@ def load_universe():
     except Exception:
         pass
 
-    uni = pd.DataFrame(rows).drop_duplicates(subset=["代碼", "市場"])
+    uni = pd.DataFrame(rows)
     if not uni.empty:
+        uni = uni.drop_duplicates(subset=["代碼", "市場"])
         uni["代碼"] = uni["代碼"].astype(str)
     return uni
 
@@ -126,14 +117,11 @@ def resolve_symbol(code: str, universe: pd.DataFrame):
     code = str(code).strip().upper()
     if code.endswith(".TW") or code.endswith(".TWO"):
         return code, ""
-
     if not universe.empty:
         m = universe[universe["代碼"] == code]
         if not m.empty:
             row = m.iloc[0]
             return row["Yahoo"], row["名稱"]
-
-    # Fallback: listed first, then OTC will be checked by caller.
     return f"{code}.TW", ""
 
 def calc_kd(df: pd.DataFrame):
@@ -144,8 +132,8 @@ def calc_kd(df: pd.DataFrame):
     den = (hh - ll).replace(0, np.nan)
     rsv = ((df["Close"] - ll) / den * 100).fillna(50)
 
-    k_vals, d_vals = [], []
     k_prev = d_prev = 50.0
+    k_vals, d_vals = [], []
     for v in rsv:
         k_now = (2/3) * k_prev + (1/3) * float(v)
         d_now = (2/3) * d_prev + (1/3) * k_now
@@ -154,7 +142,7 @@ def calc_kd(df: pd.DataFrame):
         k_prev, d_prev = k_now, d_now
     return float(k_vals[-1]), float(d_vals[-1])
 
-def resample_ohlcv(df: pd.DataFrame, rule: str):
+def resample_ohlcv(df, rule):
     return df.resample(rule).agg({
         "Open": "first",
         "High": "max",
@@ -166,33 +154,109 @@ def resample_ohlcv(df: pd.DataFrame, rule: str):
 def find_high_volume_k(df, volume_multiple=2.0, baseline_days=20, recent_days=30):
     if len(df) < baseline_days + 5:
         return None
-
     work = df.copy()
-    # Compare today's volume with the average of the PRIOR N sessions, excluding today.
     work["BaseVol"] = work["Volume"].shift(1).rolling(baseline_days).mean()
     work["VolRatio"] = work["Volume"] / work["BaseVol"].replace(0, np.nan)
-
     recent = work.tail(recent_days).dropna(subset=["VolRatio"])
+    if recent.empty:
+        return None
     candidates = recent[recent["VolRatio"] >= volume_multiple]
     if candidates.empty:
-        # Still report the largest recent ratio as a "near candidate".
         idx = recent["VolRatio"].idxmax()
-        row = recent.loc[idx]
         qualifies = False
     else:
         idx = candidates["VolRatio"].idxmax()
-        row = candidates.loc[idx]
         qualifies = True
-
+    row = recent.loc[idx]
     pos = work.index.get_loc(idx)
-    after = work.iloc[pos + 1:]
+    after = work.iloc[pos+1:]
+    return {"date": idx, "row": row, "after": after, "ratio": float(row["VolRatio"]), "qualifies": qualifies}
+
+def moving_average_info(df):
+    work = df.copy()
+    for n in (5,10,20):
+        work[f"MA{n}"] = work["Close"].rolling(n).mean()
+    last = work.iloc[-1]
+    ma5, ma10, ma20 = [float(last[f"MA{n}"]) for n in (5,10,20)]
+    if ma5 > ma10 > ma20:
+        state = "多頭排列"
+    elif ma5 < ma10 < ma20:
+        state = "空頭排列"
+    else:
+        state = "均線糾結"
+    return work, ma5, ma10, ma20, state
+
+def fibonacci_info(df):
+    swing = df.tail(min(120, len(df))).copy()
+    low_idx = swing["Low"].idxmin()
+    high_idx = swing["High"].idxmax()
+    low = float(swing.loc[low_idx, "Low"])
+    high = float(swing.loc[high_idx, "High"])
+    rng = max(high-low, 1e-9)
+    upswing = low_idx < high_idx
+    if upswing:
+        levels = {r: high - rng*r for r in FIB_RATIOS}
+    else:
+        levels = {r: low + rng*r for r in FIB_RATIOS}
+    close = float(df.iloc[-1]["Close"])
+    nearest = min(levels, key=lambda r: abs(levels[r]-close))
     return {
-        "date": idx,
-        "row": row,
-        "after": after,
-        "ratio": float(row["VolRatio"]),
-        "qualifies": qualifies,
+        "low": low, "high": high, "upswing": upswing,
+        "levels": levels, "nearest_ratio": nearest,
+        "nearest_level": levels[nearest]
     }
+
+def local_extrema(arr, mode="max", order=3):
+    pts = []
+    for i in range(order, len(arr)-order):
+        w = arr[i-order:i+order+1]
+        if mode == "max" and arr[i] == np.max(w):
+            pts.append((i, float(arr[i])))
+        elif mode == "min" and arr[i] == np.min(w):
+            pts.append((i, float(arr[i])))
+    return pts
+
+def detect_patterns(df):
+    recent = df.tail(80)
+    highs = recent["High"].to_numpy()
+    lows = recent["Low"].to_numpy()
+    peaks = local_extrema(highs, "max")
+    troughs = local_extrema(lows, "min")
+    patterns = []
+
+    if len(troughs) >= 2:
+        a, b = troughs[-2], troughs[-1]
+        sim = 1 - abs(a[1]-b[1]) / max(a[1], b[1])
+        if b[0]-a[0] >= 8 and sim >= 0.97:
+            conf = min(92, int(62 + max(0, sim-0.97)/0.03*25))
+            patterns.append(("W底（雙底）", conf, "偏多"))
+
+    if len(peaks) >= 2:
+        a, b = peaks[-2], peaks[-1]
+        sim = 1 - abs(a[1]-b[1]) / max(a[1], b[1])
+        if b[0]-a[0] >= 8 and sim >= 0.97:
+            conf = min(92, int(62 + max(0, sim-0.97)/0.03*25))
+            patterns.append(("M頭（雙頂）", conf, "偏空"))
+
+    if len(peaks) >= 3 and len(troughs) >= 3:
+        px = np.array([x for x,_ in peaks[-4:]], dtype=float)
+        py = np.array([y for _,y in peaks[-4:]], dtype=float)
+        tx = np.array([x for x,_ in troughs[-4:]], dtype=float)
+        ty = np.array([y for _,y in troughs[-4:]], dtype=float)
+        ps = np.polyfit(px, py, 1)[0] / max(np.mean(py),1)
+        ts = np.polyfit(tx, ty, 1)[0] / max(np.mean(ty),1)
+
+        if abs(ps) < .0015 and ts > .001:
+            patterns.append(("上升三角形", 74, "偏多"))
+        elif ps < -.001 and abs(ts) < .0015:
+            patterns.append(("下降三角形", 74, "偏空"))
+        elif ps < -.001 and ts > .001:
+            patterns.append(("三角收斂", 68, "等待"))
+        elif abs(ps) < .0015 and abs(ts) < .0015:
+            patterns.append(("箱型盤整", 64, "等待"))
+
+    patterns = sorted(patterns, key=lambda x: x[1], reverse=True)[:3]
+    return patterns or [("暫無高可信度型態", 0, "等待")]
 
 def analyze_df(df, volume_multiple=2.0, baseline_days=20, recent_days=30):
     if df.empty or len(df) < 80:
@@ -205,19 +269,14 @@ def analyze_df(df, volume_multiple=2.0, baseline_days=20, recent_days=30):
     row = hv["row"]
     after = hv["after"]
     current = df.iloc[-1]
-    hv_low = float(row["Low"])
-    hv_high = float(row["High"])
-    hv_mid = (hv_low + hv_high) / 2
+    hv_low, hv_high = float(row["Low"]), float(row["High"])
+    hv_mid = (hv_low + hv_high)/2
     current_close = float(current["Close"])
 
-    if after.empty:
-        min_after = current_close
-        after_avg_vol = float(current["Volume"])
-    else:
-        min_after = float(after["Low"].min())
-        after_avg_vol = float(after["Volume"].mean())
+    min_after = current_close if after.empty else float(after["Low"].min())
+    after_avg_vol = float(current["Volume"]) if after.empty else float(after["Volume"].mean())
 
-    not_broken = min_after >= hv_low * 0.995  # 0.5% tolerance for intraday noise
+    not_broken = min_after >= hv_low*0.995
     close_above_low = current_close >= hv_low
     close_above_mid = current_close >= hv_mid
     breakout = current_close > hv_high
@@ -228,95 +287,100 @@ def analyze_df(df, volume_multiple=2.0, baseline_days=20, recent_days=30):
     wk, wd = calc_kd(weekly)
     mk, md = calc_kd(monthly)
 
-    score_parts = {}
-    score_parts["高量K達門檻"] = 15 if hv["qualifies"] else 0
-    score_parts["高量K低點未破"] = 25 if not_broken else 0
-    score_parts["現價站回高量K低點"] = 10 if close_above_low else 0
-    score_parts["現價站高量K中值"] = 8 if close_above_mid else 0
-    score_parts["後續量縮"] = 12 if volume_contract else 0
-    score_parts["週K值低於30"] = 10 if (not math.isnan(wk) and wk < 30) else 0
-    score_parts["月K值低於30"] = 10 if (not math.isnan(mk) and mk < 30) else 0
-    score_parts["突破高量K高點"] = 10 if breakout else 0
-    score = int(sum(score_parts.values()))
+    work, ma5, ma10, ma20, ma_state = moving_average_info(df)
+    fib = fibonacci_info(df)
+    patterns = detect_patterns(df)
+
+    score_parts = {
+        "高量K達門檻": 15 if hv["qualifies"] else 0,
+        "高量K低點未破": 25 if not_broken else 0,
+        "現價站回高量低點": 10 if close_above_low else 0,
+        "現價站高量K中值": 8 if close_above_mid else 0,
+        "後續量縮": 12 if volume_contract else 0,
+        "週K值低於30": 10 if (not math.isnan(wk) and wk < 30) else 0,
+        "月K值低於30": 10 if (not math.isnan(mk) and mk < 30) else 0,
+        "突破高量K高點": 10 if breakout else 0,
+        "MA5>MA10>MA20": 10 if ma_state == "多頭排列" else 0,
+    }
+    raw_score = sum(score_parts.values())
+    score = min(100, int(round(raw_score / 110 * 100)))
 
     if not close_above_low:
-        status = "高量結構轉弱"
-        grade = "偏弱"
-    elif score >= 75:
-        status = "高量不破・強勢"
-        grade = "偏多"
-    elif score >= 60:
-        status = "高量不破・觀察突破"
-        grade = "偏多整理"
+        status, grade = "高量結構轉弱", "偏弱"
+    elif score >= 78:
+        status, grade = "多訊號共振", "偏多"
+    elif score >= 62:
+        status, grade = "高量不破・觀察突破", "偏多整理"
     elif score >= 45:
-        status = "高量後整理"
-        grade = "中性"
+        status, grade = "高量後整理", "中性"
     else:
-        status = "訊號不足"
-        grade = "觀察"
+        status, grade = "訊號不足", "觀察"
 
     return {
-        "score": score,
-        "status": status,
-        "grade": grade,
+        "score": score, "status": status, "grade": grade,
         "current_close": current_close,
-        "hv_date": hv["date"],
-        "hv_low": hv_low,
-        "hv_high": hv_high,
-        "hv_open": float(row["Open"]),
-        "hv_close": float(row["Close"]),
-        "hv_ratio": hv["ratio"],
-        "qualifies": hv["qualifies"],
-        "not_broken": not_broken,
-        "volume_contract": volume_contract,
+        "hv_date": hv["date"], "hv_low": hv_low, "hv_high": hv_high,
+        "hv_open": float(row["Open"]), "hv_close": float(row["Close"]),
+        "hv_ratio": hv["ratio"], "qualifies": hv["qualifies"],
+        "not_broken": not_broken, "volume_contract": volume_contract,
         "breakout": breakout,
-        "wk": wk,
-        "wd": wd,
-        "mk": mk,
-        "md": md,
+        "wk": wk, "wd": wd, "mk": mk, "md": md,
         "score_parts": score_parts,
+        "work": work, "ma5": ma5, "ma10": ma10, "ma20": ma20, "ma_state": ma_state,
+        "fib": fib, "patterns": patterns,
     }
 
 def candlestick_chart(df, result):
-    show = df.tail(90)
+    show = result["work"].tail(90)
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
-        x=show.index,
-        open=show["Open"], high=show["High"],
-        low=show["Low"], close=show["Close"],
-        name="日K"
+        x=show.index, open=show["Open"], high=show["High"],
+        low=show["Low"], close=show["Close"], name="日K"
     ))
-
-    hv_date = result["hv_date"]
-    fig.add_hline(y=result["hv_low"], line_dash="dot",
+    for n in (5,10,20):
+        fig.add_trace(go.Scatter(
+            x=show.index, y=show[f"MA{n}"], mode="lines", name=f"MA{n}"
+        ))
+    for r, level in result["fib"]["levels"].items():
+        fig.add_hline(y=level, line_dash="dot",
+                      annotation_text=f"Fib {r:.3f} {level:.2f}")
+    fig.add_hline(y=result["hv_low"], line_dash="dash",
                   annotation_text=f"高量K低點 {result['hv_low']:.2f}")
-    fig.add_hline(y=result["hv_high"], line_dash="dot",
+    fig.add_hline(y=result["hv_high"], line_dash="dash",
                   annotation_text=f"高量K高點 {result['hv_high']:.2f}")
-    if hv_date in show.index:
-        fig.add_vline(x=hv_date, line_dash="dash",
-                      annotation_text=f"高量K {pd.Timestamp(hv_date).strftime('%Y-%m-%d')}")
-
+    if result["hv_date"] in show.index:
+        fig.add_vline(x=result["hv_date"], line_dash="dash",
+                      annotation_text=f"高量K {pd.Timestamp(result['hv_date']).strftime('%Y-%m-%d')}")
     fig.update_layout(
-        height=510,
-        margin=dict(l=10, r=10, t=35, b=10),
-        xaxis_rangeslider_visible=False,
-        legend_orientation="h",
-        hovermode="x unified",
+        height=560, margin=dict(l=10,r=10,t=40,b=10),
+        xaxis_rangeslider_visible=False, hovermode="x unified",
+        legend_orientation="h"
     )
     return fig
 
-def score_color(score):
-    if score >= 75:
-        return "🟢"
-    if score >= 60:
-        return "🟩"
-    if score >= 45:
-        return "🟡"
-    return "🔴"
+def scan_one(row, volume_multiple, recent_days):
+    df = fetch_history(row["Yahoo"], "1y")
+    result = analyze_df(df, volume_multiple, 20, recent_days)
+    if result is None:
+        return None
+    p = result["patterns"][0]
+    return {
+        "代碼": row["代碼"], "名稱": row["名稱"], "市場": row["市場"],
+        "分數": result["score"], "判讀": result["status"],
+        "最新收盤": round(result["current_close"], 2),
+        "高量倍數": round(result["hv_ratio"], 2),
+        "高量K未跌破": "是" if result["not_broken"] else "否",
+        "MA結構": result["ma_state"],
+        "週K": round(result["wk"], 1),
+        "月K": round(result["mk"], 1),
+        "型態": p[0],
+        "型態相似度": p[1],
+        "最近Fib": f"{result['fib']['nearest_ratio']:.3f}",
+        "突破高量K": "是" if result["breakout"] else "否",
+    }
 
-# ---------- Header ----------
 st.title("📈 台股量價籌碼分析系統")
-st.caption("真實行情版 v2｜高量K × 週/月KD × 量價結構 × 自動評分 × 選股掃描")
+st.caption("技術分析版 v3｜高量K × 週/月KD × MA5/10/20 × Fibonacci × 型態辨識 × 選股掃描")
 st.info("資料來源：Yahoo Finance 歷史行情；上市/上櫃公司名單使用 TWSE、TPEx OpenAPI。技術訊號僅作研究與篩選，不代表買賣建議。")
 
 with st.sidebar:
@@ -324,24 +388,16 @@ with st.sidebar:
     volume_multiple = st.slider("高量門檻（相對前20日均量）", 1.5, 4.0, 2.0, 0.1)
     recent_days = st.slider("尋找最近幾個交易日的高量K", 10, 60, 30, 5)
     st.markdown("---")
-    st.markdown("""
-    **目前評分邏輯**
-    - 高量達門檻：15
-    - 高量低點未破：25
-    - 現價站回高量低點：10
-    - 現價站高量K中值：8
-    - 後續量縮：12
-    - 週K < 30：10
-    - 月K < 30：10
-    - 突破高量K高點：10
-    """)
+    st.markdown("**Fibonacci 比例**")
+    st.write("0.191 / 0.382 / 0.500 / 0.618 / 0.809")
+    st.markdown("---")
+    st.caption("v3 新增：MA5/10/20、費波那契、型態辨識、掃描欄位擴充。")
 
 universe = load_universe()
 tab1, tab2, tab3 = st.tabs(["🔎 單檔分析", "🧭 選股掃描", "📘 判讀規則"])
 
-# ---------- Single stock ----------
 with tab1:
-    c1, c2 = st.columns([2, 1])
+    c1, c2 = st.columns([2,1])
     with c1:
         code = st.text_input("股票代碼", value="2330", placeholder="例如：2330、1301、6488")
     with c2:
@@ -352,19 +408,18 @@ with tab1:
         with st.spinner(f"正在讀取 {symbol} 歷史行情…"):
             df = fetch_history(symbol, "2y")
             if df.empty and symbol.endswith(".TW"):
-                symbol2 = f"{str(code).strip()}.TWO"
-                df2 = fetch_history(symbol2, "2y")
+                alt = f"{str(code).strip()}.TWO"
+                df2 = fetch_history(alt, "2y")
                 if not df2.empty:
-                    symbol = symbol2
-                    df = df2
+                    symbol, df = alt, df2
 
         if df.empty:
             st.error("抓不到這檔股票的歷史行情。請確認股票代碼，或稍後再試。")
         else:
             name = known_name
             if not name and not universe.empty:
-                raw_code = symbol.replace(".TW", "").replace(".TWO", "")
-                m = universe[universe["代碼"] == raw_code]
+                raw = symbol.replace(".TW","").replace(".TWO","")
+                m = universe[universe["代碼"] == raw]
                 if not m.empty:
                     name = m.iloc[0]["名稱"]
 
@@ -373,14 +428,22 @@ with tab1:
                 st.warning("歷史資料不足，暫時無法完成判讀。")
             else:
                 st.subheader(f"{symbol.replace('.TW','').replace('.TWO','')} {name}".strip())
-                m1, m2, m3, m4, m5 = st.columns(5)
-                m1.metric("最新收盤", f"{result['current_close']:.2f}")
-                m2.metric("總分", f"{result['score']} / 100")
-                m3.metric("高量倍數", f"{result['hv_ratio']:.2f}×")
-                m4.metric("週KD", f"K {result['wk']:.1f} / D {result['wd']:.1f}")
-                m5.metric("月KD", f"K {result['mk']:.1f} / D {result['md']:.1f}")
 
-                if result["score"] >= 75:
+                a,b,c,d = st.columns(4)
+                a.metric("最新收盤", f"{result['current_close']:.2f}")
+                b.metric("綜合分數", f"{result['score']} / 100")
+                c.metric("近期最大量", f"{result['hv_ratio']:.2f}×",
+                         delta="達高量門檻" if result["qualifies"] else f"未達 {volume_multiple:.1f}× 門檻")
+                d.metric("均線結構", result["ma_state"])
+
+                m1,m2,m3,m4,m5 = st.columns(5)
+                m1.metric("MA5", f"{result['ma5']:.2f}")
+                m2.metric("MA10", f"{result['ma10']:.2f}")
+                m3.metric("MA20", f"{result['ma20']:.2f}")
+                m4.metric("週KD", f"K {result['wk']:.1f}｜D {result['wd']:.1f}")
+                m5.metric("月KD", f"K {result['mk']:.1f}｜D {result['md']:.1f}")
+
+                if result["score"] >= 78:
                     st.success(f"🟢 系統判讀：{result['status']}｜{result['grade']}")
                 elif result["score"] >= 45:
                     st.warning(f"🟡 系統判讀：{result['status']}｜{result['grade']}")
@@ -389,9 +452,35 @@ with tab1:
 
                 st.plotly_chart(candlestick_chart(df, result), use_container_width=True)
 
-                left, right = st.columns([1.2, 1])
+                f1, f2 = st.columns([1.15, 1])
+                with f1:
+                    st.markdown("### Fibonacci")
+                    st.caption(
+                        f"自動波段：{result['fib']['low']:.2f} → {result['fib']['high']:.2f}；"
+                        f"目前最接近 Fib {result['fib']['nearest_ratio']:.3f}"
+                    )
+                    fib_df = pd.DataFrame([
+                        {
+                            "比例": f"{r:.3f}",
+                            "價位": round(level,2),
+                            "距現價%": round((level/result["current_close"]-1)*100,2)
+                        }
+                        for r, level in result["fib"]["levels"].items()
+                    ])
+                    st.dataframe(fib_df, hide_index=True, use_container_width=True)
+
+                with f2:
+                    st.markdown("### 型態辨識")
+                    pat_df = pd.DataFrame([
+                        {"型態": p, "相似度": f"{conf}%" if conf else "—", "方向": direction}
+                        for p,conf,direction in result["patterns"]
+                    ])
+                    st.dataframe(pat_df, hide_index=True, use_container_width=True)
+                    st.caption("型態是演算法相似度提示；未突破頸線／趨勢線前，不視為已確認訊號。")
+
+                left, right = st.columns([1.2,1])
                 with left:
-                    st.markdown("#### 高量K關鍵資料")
+                    st.markdown("### 高量K關鍵資料")
                     key_df = pd.DataFrame([
                         ["高量K日期", pd.Timestamp(result["hv_date"]).strftime("%Y-%m-%d")],
                         ["開盤", f"{result['hv_open']:.2f}"],
@@ -399,63 +488,40 @@ with tab1:
                         ["最低", f"{result['hv_low']:.2f}"],
                         ["收盤", f"{result['hv_close']:.2f}"],
                         ["相對前20日均量", f"{result['hv_ratio']:.2f}×"],
+                        ["是否達高量門檻", "是 ✅" if result["qualifies"] else "否"],
                         ["後續是否跌破", "否 ✅" if result["not_broken"] else "是 ⚠️"],
                         ["後續是否量縮", "是 ✅" if result["volume_contract"] else "否"],
                         ["是否突破高量K高點", "是 ✅" if result["breakout"] else "否"],
-                    ], columns=["項目", "結果"])
+                    ], columns=["項目","結果"])
                     st.dataframe(key_df, hide_index=True, use_container_width=True)
 
                 with right:
-                    st.markdown("#### 評分拆解")
+                    st.markdown("### 評分拆解")
                     score_df = pd.DataFrame(
-                        [{"條件": k, "得分": v} for k, v in result["score_parts"].items()]
+                        [{"條件": k, "得分": v} for k,v in result["score_parts"].items()]
                     )
                     st.dataframe(score_df, hide_index=True, use_container_width=True)
 
-                st.markdown("#### 風險位置")
+                st.markdown("### 關鍵價位")
                 st.write(
-                    f"目前系統把 **{result['hv_low']:.2f}** 視為這根高量K的重要防守價。"
-                    f"若後續收盤明顯跌破，『高量不破』的判讀會失效；"
-                    f"若重新突破 **{result['hv_high']:.2f}**，則代表價格重新站上高量K壓力區。"
+                    f"高量K防守價：**{result['hv_low']:.2f}** ｜ "
+                    f"高量K突破價：**{result['hv_high']:.2f}** ｜ "
+                    f"最近 Fibonacci：**{result['fib']['nearest_level']:.2f}**"
                 )
 
-# ---------- Scanner ----------
-def scan_one(row, volume_multiple, recent_days):
-    symbol = row["Yahoo"]
-    df = fetch_history(symbol, "1y")
-    result = analyze_df(df, volume_multiple, 20, recent_days)
-    if result is None:
-        return None
-    return {
-        "代碼": row["代碼"],
-        "名稱": row["名稱"],
-        "市場": row["市場"],
-        "分數": result["score"],
-        "判讀": result["status"],
-        "最新收盤": round(result["current_close"], 2),
-        "高量倍數": round(result["hv_ratio"], 2),
-        "高量K日期": pd.Timestamp(result["hv_date"]).strftime("%Y-%m-%d"),
-        "高量K低點": round(result["hv_low"], 2),
-        "未跌破": "是" if result["not_broken"] else "否",
-        "後續量縮": "是" if result["volume_contract"] else "否",
-        "週K": round(result["wk"], 1),
-        "月K": round(result["mk"], 1),
-        "突破高量K": "是" if result["breakout"] else "否",
-    }
-
 with tab2:
-    st.markdown("### 量價選股掃描")
-    st.caption("先用自選清單快速掃描最實用；也可載入交易所公司名單。全市場大量下載時，Yahoo Finance 可能暫時限流。")
+    st.markdown("### 量價技術選股掃描")
+    st.caption("先用自選清單快速掃描；全市場大量下載時，Yahoo Finance 可能暫時限流。")
 
     source = st.radio("掃描範圍", ["自選股票", "交易所名單"], horizontal=True)
-
     scan_rows = pd.DataFrame()
+
     if source == "自選股票":
         watch = st.text_area(
             "輸入股票代碼（逗號、空白或換行分隔）",
             value="2330, 2317, 2454, 2308, 2382, 3231, 1301, 2881, 2882, 2603"
         )
-        codes = [x.strip() for x in watch.replace(",", " ").replace("\n", " ").split() if x.strip()]
+        codes = [x.strip() for x in watch.replace(","," ").replace("\n"," ").split() if x.strip()]
         rows = []
         for c in codes:
             sym, _ = resolve_symbol(c, universe)
@@ -473,14 +539,14 @@ with tab2:
         if universe.empty:
             st.error("目前無法取得交易所公司名單，請改用『自選股票』。")
         else:
-            markets = st.multiselect("市場", ["上市", "上櫃"], default=["上市", "上櫃"])
+            markets = st.multiselect("市場", ["上市","上櫃"], default=["上市","上櫃"])
             filtered = universe[universe["市場"].isin(markets)].copy()
-            limit_opt = st.selectbox("本次掃描數量", [50, 100, 200, 300, "全部"], index=1)
+            limit_opt = st.selectbox("本次掃描數量", [50,100,200,300,"全部"], index=1)
             if limit_opt != "全部":
                 filtered = filtered.head(int(limit_opt))
             scan_rows = filtered
 
-    min_score = st.slider("最低顯示分數", 0, 100, 60, 5)
+    min_score = st.slider("最低顯示分數", 0,100,60,5)
     only_not_broken = st.checkbox("只顯示高量K未跌破", value=True)
 
     if st.button("執行掃描", type="primary", key="scan"):
@@ -492,11 +558,10 @@ with tab2:
             status = st.empty()
             total = len(scan_rows)
 
-            # Moderate concurrency: useful, but less likely to trigger data-source throttling.
             with ThreadPoolExecutor(max_workers=6) as ex:
                 futures = {
                     ex.submit(scan_one, row, volume_multiple, recent_days): i
-                    for i, (_, row) in enumerate(scan_rows.iterrows(), start=1)
+                    for i, (_,row) in enumerate(scan_rows.iterrows(), start=1)
                 }
                 done = 0
                 for fut in as_completed(futures):
@@ -507,7 +572,7 @@ with tab2:
                             results.append(r)
                     except Exception:
                         pass
-                    progress.progress(done / total)
+                    progress.progress(done/total)
                     status.caption(f"已完成 {done} / {total}")
 
             out = pd.DataFrame(results)
@@ -516,42 +581,49 @@ with tab2:
             else:
                 out = out[out["分數"] >= min_score]
                 if only_not_broken:
-                    out = out[out["未跌破"] == "是"]
-                out = out.sort_values(["分數", "高量倍數"], ascending=[False, False]).reset_index(drop=True)
-                out.insert(0, "排名", range(1, len(out) + 1))
+                    out = out[out["高量K未跌破"] == "是"]
+                out = out.sort_values(["分數","高量倍數"], ascending=[False,False]).reset_index(drop=True)
+                out.insert(0, "排名", range(1,len(out)+1))
 
                 st.success(f"掃描完成，共找到 {len(out)} 檔符合目前條件。")
-                st.dataframe(out, hide_index=True, use_container_width=True, height=600)
+                st.dataframe(out, hide_index=True, use_container_width=True, height=620)
 
                 csv = out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
                 st.download_button(
                     "下載掃描結果 CSV",
                     data=csv,
-                    file_name=f"台股量價掃描_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    file_name=f"台股技術掃描_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
                     mime="text/csv",
                 )
 
 with tab3:
     st.markdown("""
-### 這套程式怎麼判斷？
+### v3 判讀規則
 
-**1. 先找近期的高量K**  
-系統把當日成交量與「前 20 個交易日平均成交量」比較。預設達到 2 倍以上，就視為異常高量候選。
+**高量K**  
+當日成交量與前20個交易日平均量比較；預設 2 倍以上才算達門檻。若沒有達門檻，系統仍會顯示近期最大量，但清楚標示「未達門檻」。
 
-**2. 再看高量K之後有沒有破低**  
-影片裡最重要的概念不是「看到爆量就買」，而是高量出現後，價格是否守得住那根K棒。  
-目前程式把高量K最低價視為重要防守區，並保留 0.5% 的盤中雜訊容忍。
+**MA5 / MA10 / MA20**  
+- MA5 > MA10 > MA20：多頭排列
+- MA5 < MA10 < MA20：空頭排列
+- 其他：均線糾結
 
-**3. 看後續是否量縮**  
-如果高量之後整理時成交量下降，通常比「一路爆量下跌」健康，因此納入加分。
+**Fibonacci**  
+自動抓最近 120 個交易日的波段高低點，使用：
+0.191 / 0.382 / 0.500 / 0.618 / 0.809
 
-**4. 加入週KD與月KD**  
-日線量價偏短線，所以再加入週、月尺度，避免只看一兩天的訊號。
+**型態辨識**  
+目前先辨識：
+- W底（雙底）
+- M頭（雙頂）
+- 上升三角形
+- 下降三角形
+- 三角收斂
+- 箱型盤整
 
-**5. 用評分，而不是直接宣告洗盤或出貨**  
-「洗盤／出貨」是市場解讀，不可能只靠一根K棒百分之百確認。這版因此使用 0–100 分，把不同證據疊加，再分成偏多、整理、中性、偏弱。
+型態只提供「相似度」，不直接等同買賣訊號。
 
-### 建議的實際用法
-先用掃描器找出 60–75 分以上的股票，再進單檔分析看高量K位置、KD與後續價格。  
-真正下決策前，仍應搭配基本面、產業趨勢、法人籌碼與大盤環境。
+**使用方式**  
+先用掃描器找 60 分以上股票，再進單檔分析檢查：
+高量K是否守住、均線排列、週/月KD、Fibonacci位置與型態是否同方向。
 """)
